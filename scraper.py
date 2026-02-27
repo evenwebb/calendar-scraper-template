@@ -15,6 +15,7 @@ import datetime
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -52,6 +53,7 @@ logger = logging.getLogger(__name__)
 error_handler = logging.FileHandler(config.LOG_FILE)
 error_handler.setLevel(logging.ERROR)
 logger.addHandler(error_handler)
+ICAL_NEWLINE = "\r\n"
 
 
 # ============================================================================
@@ -343,13 +345,15 @@ def generate_alarm(alarm_config: Dict[str, Any], event_start: datetime.datetime)
         trigger_line = f"TRIGGER:-P{days}D"
 
     description = alarm_config.get("description", "Event Reminder")
-    return (
-        "BEGIN:VALARM\n"
-        "ACTION:DISPLAY\n"
-        f"DESCRIPTION:{description}\n"
-        f"{trigger_line}\n"
-        "END:VALARM\n"
-    )
+    alarm_lines = [
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        escape_and_fold_ical_text(description, "DESCRIPTION:", config.ICAL_LINE_LENGTH),
+        trigger_line,
+        "END:VALARM",
+        "",
+    ]
+    return ICAL_NEWLINE.join(alarm_lines)
 
 
 def make_ics_event(event: Dict[str, Any]) -> str:
@@ -424,23 +428,33 @@ def make_ics_event(event: Dict[str, Any]) -> str:
             dtstamp_str = format_ical_datetime(upd_dt)
 
     # Build VEVENT
+    summary_line = escape_and_fold_ical_text(title, "SUMMARY:", config.ICAL_LINE_LENGTH)
+    description_line = escape_and_fold_ical_text(
+        description_text,
+        "DESCRIPTION:",
+        config.ICAL_LINE_LENGTH,
+    )
     lines = [
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{dtstamp_str}",
         f"DTSTART:{start_str}",
         f"DTEND:{end_str}",
-        f"SUMMARY:{title}",
-        escape_and_fold_ical_text(description_text, "DESCRIPTION:", config.ICAL_LINE_LENGTH),
+        summary_line,
+        description_line,
     ]
 
     # LOCATION
     if location:
-        lines.append(f"LOCATION:{location}")
+        lines.append(
+            escape_and_fold_ical_text(location, "LOCATION:", config.ICAL_LINE_LENGTH)
+        )
 
     # URL
     if event_url:
-        lines.append(f"URL:{event_url}")
+        lines.append(
+            escape_and_fold_ical_text(event_url, "URL:", config.ICAL_LINE_LENGTH)
+        )
 
     # GEO (if coordinates available) - CUSTOMIZE if your events have coordinates
     lat, lon = event.get("map_latitude"), event.get("map_longitude")
@@ -456,10 +470,12 @@ def make_ics_event(event: Dict[str, Any]) -> str:
     # VALARMs (nested components)
     if config.NOTIFICATIONS.get("enabled", False):
         for alarm in config.NOTIFICATIONS.get("alarms", []):
-            lines.extend(line for line in generate_alarm(alarm, start_dt).split("\n") if line.strip())
+            lines.extend(
+                line for line in generate_alarm(alarm, start_dt).splitlines() if line.strip()
+            )
 
     lines.append("END:VEVENT")
-    return "\n".join(lines) + "\n"
+    return ICAL_NEWLINE.join(lines) + ICAL_NEWLINE
 
 
 # ============================================================================
@@ -520,7 +536,7 @@ def main() -> None:
             "Failed to fetch events from website",
             str(e)
         )
-        raise
+        sys.exit(1)
 
     # Split into future and past
     today = datetime.datetime.now(datetime.timezone.utc)
@@ -577,14 +593,21 @@ def main() -> None:
             event_lines.append(ical)
 
     ical_content = (
-        "BEGIN:VCALENDAR\n"
-        "VERSION:2.0\n"
-        f"PRODID:{config.CALENDAR_PRODID}\n"
-        "CALSCALE:GREGORIAN\n"
-        f"X-WR-CALNAME:{config.CALENDAR_NAME}\n"
-        f"X-WR-CALDESC:{config.CALENDAR_DESCRIPTION}\n"
+        ICAL_NEWLINE.join(
+            [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                f"PRODID:{config.CALENDAR_PRODID}",
+                "CALSCALE:GREGORIAN",
+                "METHOD:PUBLISH",
+                f"X-WR-CALNAME:{config.CALENDAR_NAME}",
+                f"X-WR-CALDESC:{config.CALENDAR_DESCRIPTION}",
+                f"X-WR-TIMEZONE:{config.DEFAULT_TIMEZONE}",
+            ]
+        )
+        + ICAL_NEWLINE
         + "".join(event_lines)
-        + "END:VCALENDAR\n"
+        + f"END:VCALENDAR{ICAL_NEWLINE}"
     )
 
     ics_path = Path(config.OUTPUT_DIR) / f"{config.ICS_FILENAME}.ics"
