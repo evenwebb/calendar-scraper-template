@@ -1,0 +1,20 @@
+[project]
+name = "calendar-scraper-template"
+version = "1.0.0"
+description = "Template for building calendar scrapers that generate iCalendar (RFC 5545) and HTML outputs"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "requests>=2.31.0,<3.0.0",
+    "beautifulsoup4>=4.12.0,<5.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+]
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0,<9.0.0",
+]

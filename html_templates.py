@@ -3,6 +3,12 @@
 CUSTOMIZE THIS to match your branding, colors, and layout preferences.
 """
 import datetime
+import html as _html
+
+
+def _esc(text: str) -> str:
+    """HTML-escape text for safe insertion into HTML."""
+    return _html.escape(str(text or ""), quote=True)
 import json
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +19,8 @@ from utils import parse_iso_datetime, strip_html
 def build_index_html(
     events: List[Dict[str, Any]],
     upcoming_count: Optional[int] = None,
-    health_status: Optional[Dict[str, Any]] = None
+    health_status: Optional[Dict[str, Any]] = None,
+    webcal_url: str = ""
 ) -> str:
     """Build the index HTML page with calendar link and featured events.
 
@@ -54,8 +61,8 @@ def build_index_html(
       <div class="health-icon">{status_emoji}</div>
       <div class="health-info">
         <div class="health-main">Last updated: <span id="healthTimestamp" data-timestamp="{last_update}">{time_ago}</span></div>
-        <div class="health-message">{message}</div>
-        {f'<div class="health-error">Error: {error}</div>' if error else ''}
+        <div class="health-message">{_esc(message)}</div>
+        {f'<div class="health-error">Error: {_esc(error)}</div>' if error else ''}
       </div>
     </div>'''
 
@@ -102,7 +109,7 @@ def build_index_html(
                 f'<div class="featured-event" data-event-idx="{idx}" onclick="showEventModal({idx})">'
                 f'<div class="event-content">'
                 f'<span class="date">{date_str}</span>'
-                f'<span class="title">{title}</span>'
+                f'<span class="title">{_esc(title)}</span>'
                 f'<span class="location-small">📍 {location[:50]}{"..." if len(location) > 50 else ""}</span>'
                 f'</div>'
                 f"</div>"
@@ -226,6 +233,7 @@ def build_index_html(
       <h2>Subscribe to the calendar</h2>
       <p>{count} upcoming event{'' if count == 1 else 's'}</p>
       <a href="{ics_url}" class="btn">📅 Subscribe</a>
+      {'<a href="' + webcal_url + '" class="btn">🔗 Add to Calendar</a>' if webcal_url else ''}
       <a href="{ics_url}" class="btn" download>💾 Download .ics</a>
     </section>
 
@@ -301,14 +309,14 @@ def build_archive_html(past_events: List[Dict[str, Any]]) -> str:
                 slug = event.get("slug", "")
                 url = f"{config.BASE_URL}/events/{slug}" if slug else ""
 
-                location_html = f'<span class="location">{location}</span>' if location else ''
-                link_html = f'<a href="{url}" target="_blank">View details →</a>' if url else ''
+                location_html = f'<span class="location">{_esc(location)}</span>' if location else ''
+                link_html = f'<a href="{_esc(url)}" target="_blank">View details →</a>' if url else ''
 
                 events_html += f'''
         <div class="archive-event">
           <div class="archive-date">{date_str}</div>
           <div class="archive-details">
-            <div class="archive-title">{title}</div>
+            <div class="archive-title">{_esc(title)}</div>
             {location_html}
           </div>
           {link_html}
@@ -365,5 +373,61 @@ def build_archive_html(past_events: List[Dict[str, Any]]) -> str:
     </header>
     {events_html}
   </div>
+</body>
+</html>"""
+
+def build_event_page(event: dict, slug: str, site_url: str = "") -> str:
+    """Generate a single-event HTML page with JSON-LD structured data (#32, #33)."""
+    title = event.get("title", "Untitled Event")
+    description = event.get("description", "")
+    location = event.get("location", "")
+    start_at = event.get("start_at", "")
+    end_at = event.get("end_at", "")
+    url = event.get("url", "")
+    image = event.get("image", event.get("poster_url", ""))
+    
+    # JSON-LD structured data (#33)
+    json_ld = {
+        "@context": "https://schema.org",
+        "@type": "Event",
+        "name": title,
+        "startDate": start_at,
+        "endDate": end_at or start_at,
+        "description": description,
+    }
+    if location:
+        json_ld["location"] = {"@type": "Place", "name": location}
+    if url:
+        json_ld["url"] = url
+    if image:
+        json_ld["image"] = image
+    
+    page_url = f"{site_url.rstrip('/')}/events/{slug}.html" if site_url else ""
+    
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{_esc(title)}</title>
+    <script type="application/ld+json">{json.dumps(json_ld)}</script>
+    <style>
+        body{{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.6}}
+        img.event-image{{max-width:100%;height:auto;border-radius:8px}}
+        a{{color:#0969da}}
+        a.subscribe{{display:inline-block;margin:1rem 0;padding:0.5rem 1rem;background:#0969da;color:#fff;border-radius:6px;text-decoration:none}}
+    </style>
+</head>
+<body>
+    <main>
+        <h1>{_esc(title)}</h1>
+        {f'<p class="location">{_esc(location)}</p>' if location else ''}
+        {f'<p class="datetime">{_esc(str(start_at))}</p>' if start_at else ''}
+        {f'<div class="description">{_esc(description)}</div>' if description else ''}
+        {f'<img src="{_esc(image)}" alt="{_esc(title)}" class="event-image">' if image else ''}
+        {f'<p><a href="{_esc(url)}">Event details</a></p>' if url else ''}
+        {f'<p><a href="{_esc(page_url.replace("https://", "webcal://"))}" class="subscribe">Subscribe to Calendar</a></p>' if page_url else ''}
+        <p><a href="../index.html">← Back to events</a></p>
+    </main>
 </body>
 </html>"""

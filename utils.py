@@ -4,8 +4,12 @@ Reusable helper functions for common tasks like date parsing,
 HTML cleaning, URL normalization, and text sanitization.
 """
 import datetime
+import json
+import os
 import re
-from typing import Optional
+import tempfile
+from pathlib import Path
+from typing import Any, Optional
 
 
 def strip_html(html: str) -> str:
@@ -271,6 +275,32 @@ def truncate_text(text: str, max_length: int, suffix: str = "...") -> str:
     if not text or len(text) <= max_length:
         return text
     return text[: max_length - len(suffix)] + suffix
+
+
+def atomic_write(path: Path, content: str) -> None:
+    """Write content to file atomically to prevent corruption on crash.
+
+    Writes to a temp file in the same directory, then renames.
+    If the process crashes mid-write, the original file is untouched.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        os.replace(tmp, path)
+    except Exception:
+        os.close(fd)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """Atomically write JSON data to file."""
+    content = json.dumps(data, indent=2, ensure_ascii=False)
+    atomic_write(path, content)
 
 
 def extract_text_between(text: str, start: str, end: str) -> Optional[str]:

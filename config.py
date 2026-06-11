@@ -90,6 +90,32 @@ NOTIFICATIONS: Dict[str, Any] = {
 }
 
 # ============================================================================
+# METRICS (#37)
+# ============================================================================
+METRICS_ENABLED = os.environ.get("METRICS_ENABLED", "true").lower() in ("1", "true", "yes")
+METRICS_FILE = os.environ.get("METRICS_FILE", ".metrics")
+
+# ============================================================================
+# CACHE DIRECTORY (#45)
+# ============================================================================
+CACHE_DIR = os.environ.get("CACHE_DIR", "")
+if CACHE_DIR:
+    CACHE_FILE = os.path.join(CACHE_DIR, os.path.basename(CACHE_FILE))
+    STATE_FILE = os.path.join(CACHE_DIR, os.path.basename(STATE_FILE))
+    HEALTH_FILE = os.path.join(CACHE_DIR, os.path.basename(HEALTH_FILE))
+
+# ============================================================================
+# PUSHOVER NOTIFICATIONS (#40)
+# ============================================================================
+PUSHOVER_ENABLED = os.environ.get("PUSHOVER_TOKEN") is not None and os.environ.get("PUSHOVER_USER") is not None
+
+# ============================================================================
+# WEB SUBSCRIPTION LINK (#34)
+# ============================================================================
+# Public URL where ICS file will be hosted (for webcal:// link generation)
+SITE_URL = os.environ.get("SITE_URL", os.environ.get("CALENDAR_SITE_URL", ""))
+
+# ============================================================================
 # HTML GENERATION SETTINGS
 # ============================================================================
 # Site branding
@@ -188,3 +214,4 @@ MAX_EVENTS = 0
 
 # Timezone for events without timezone info (ISO format, e.g., "UTC", "Europe/London")
 DEFAULT_TIMEZONE = "UTC"
+GENERATE_EVENT_PAGES = os.environ.get("GENERATE_EVENT_PAGES", "false").lower() in ("1", "true", "yes")

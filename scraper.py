@@ -11,7 +11,9 @@ CUSTOMIZATION REQUIRED:
 
 See TEMPLATE_GUIDE.md for detailed customization instructions.
 """
+import argparse
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -22,8 +24,16 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass
+
 import config
 from utils import (
+    atomic_write,
+    atomic_write_json,
     escape_and_fold_ical_text,
     format_ical_datetime,
     parse_iso_datetime,
@@ -141,10 +151,9 @@ def load_cache() -> Dict[str, dict]:
 
 
 def save_cache(cache: Dict[str, dict]) -> None:
-    """Save event detail cache to disk."""
+    """Save event detail cache to disk atomically."""
     try:
-        with open(config.CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
+        atomic_write_json(Path(config.CACHE_FILE), cache)
         logger.info("Saved event cache with %d entries", len(cache))
     except OSError as e:
         logger.warning("Cache save failed: %s", e)
@@ -171,12 +180,10 @@ def save_last_upcoming_slugs(slugs: List[str]) -> None:
     """Save the current upcoming event slugs for next run comparison."""
     Path(config.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     try:
-        with open(config.STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {"slugs": slugs, "updated": datetime.datetime.now().isoformat()},
-                f,
-                indent=2,
-            )
+        atomic_write_json(
+            Path(config.STATE_FILE),
+            {"slugs": slugs, "updated": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+        )
         logger.info("Saved state with %d upcoming slugs", len(slugs))
     except OSError as e:
         logger.warning("State save failed: %s", e)
@@ -207,8 +214,7 @@ def save_health_status(
         "error": error,
     }
     try:
-        with open(config.HEALTH_FILE, "w", encoding="utf-8") as f:
-            json.dump(health_data, f, indent=2)
+        atomic_write_json(Path(config.HEALTH_FILE), health_data)
         logger.info("Saved health status: %s", status)
     except OSError as e:
         logger.warning("Health status save failed: %s", e)
@@ -456,7 +462,7 @@ def make_ics_event(event: Dict[str, Any]) -> str:
             escape_and_fold_ical_text(event_url, "URL:", config.ICAL_LINE_LENGTH)
         )
 
-    # GEO (if coordinates available) - CUSTOMIZE if your events have coordinates
+    # GEO (if coordinates available)
     lat, lon = event.get("map_latitude"), event.get("map_longitude")
     if lat is not None and lon is not None:
         try:
@@ -464,8 +470,18 @@ def make_ics_event(event: Dict[str, Any]) -> str:
         except (TypeError, ValueError):
             pass
 
+    # X-ALT-DESC: HTML version of description for rich calendar clients (#42)
+    html_desc = event.get("html_description") or event.get("description_html", "")
+    if html_desc:
+        folded = escape_and_fold_ical_text(html_desc, "X-ALT-DESC;FMTTYPE=text/html:", config.ICAL_LINE_LENGTH)
+        lines.append(folded)
+
     # STATUS
     lines.append("STATUS:CONFIRMED")
+
+    # SEQUENCE: increment on update so subscribers pick up changes
+    sequence = event.get("sequence", 0)
+    lines.append(f"SEQUENCE:{sequence}")
 
     # VALARMs (nested components)
     if config.NOTIFICATIONS.get("enabled", False):
@@ -479,11 +495,135 @@ def make_ics_event(event: Dict[str, Any]) -> str:
 
 
 # ============================================================================
+# NOTIFICATIONS (#40)
+# ============================================================================
+
+def send_pushover_notification(title: str, message: str, priority: int = 0) -> bool:
+    """Send Pushover notification. Returns True if sent successfully."""
+    token = os.environ.get("PUSHOVER_TOKEN")
+    user = os.environ.get("PUSHOVER_USER")
+    if not token or not user:
+        return False
+    try:
+        resp = requests.post("https://api.pushover.net/1/messages.json", data={
+            "token": token, "user": user, "title": title,
+            "message": message, "priority": priority,
+        }, timeout=10)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+# ============================================================================
+# PROMETHEUS METRICS (#37)
+# ============================================================================
+
+def write_metrics_file(event_count: int, upcoming_count: int, status: str, duration_s: float) -> None:
+    """Write OpenMetrics-format metrics file for Prometheus scraping."""
+    if not config.METRICS_ENABLED:
+        return
+    lines = [
+        "# HELP scraper_up Whether the last scrape was successful (1=yes, 0=no)",
+        "# TYPE scraper_up gauge",
+        f"scraper_up {1 if status == 'success' else 0}",
+        "# HELP scraper_events_total Total events in output",
+        "# TYPE scraper_events_total gauge",
+        f"scraper_events_total {event_count}",
+        "# HELP scraper_upcoming_events Events in the future",
+        "# TYPE scraper_upcoming_events gauge",
+        f"scraper_upcoming_events {upcoming_count}",
+        "# HELP scraper_duration_seconds Scrape duration in seconds",
+        "# TYPE scraper_duration_seconds gauge",
+        f"scraper_duration_seconds {duration_s:.3f}",
+        "",
+    ]
+    metrics_path = Path(config.OUTPUT_DIR) / config.METRICS_FILE
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(metrics_path, "\n".join(lines))
+
+
+# ============================================================================
+# CATCH-UP MODE (#41)
+# ============================================================================
+
+def check_missed_runs() -> int:
+    """Check state file for consecutive missed runs. Returns days since last success."""
+    state_path = Path(config.STATE_FILE)
+    if not state_path.exists():
+        return 0
+    try:
+        data = json.loads(state_path.read_text())
+        last = data.get("updated", "")
+        if last:
+            last_dt = datetime.datetime.fromisoformat(last)
+            return (datetime.datetime.now(datetime.timezone.utc) - last_dt).days
+    except (json.JSONDecodeError, ValueError, OSError):
+        pass
+    return 0
+
+
+# ============================================================================
 # MAIN FUNCTION
 # ============================================================================
 
+def _validate_config() -> list[str]:
+    """Check for common config mistakes. Returns list of warnings."""
+    warnings = []
+    placeholders = ["{{SITE_NAME}}", "{{CALENDAR_NAME}}", "{{UID_DOMAIN}}", "{{ORGANIZATION}}"]
+    for key, val in vars(config).items():
+        if isinstance(val, str) and any(p in val for p in placeholders):
+            warnings.append(f"{key} still contains placeholder: {val}")
+    if config.EXTRACTION_METHOD == "api" and not config.API_ENDPOINT:
+        warnings.append("EXTRACTION_METHOD is 'api' but API_ENDPOINT is empty")
+    return warnings
+
+
 def main() -> None:
     """Main function to scrape events and generate iCal file."""
+    parser = argparse.ArgumentParser(description="Calendar scraper")
+    parser.add_argument("--dry-run", action="store_true", help="Scrape and validate but skip file writes")
+    parser.add_argument("--output-dir", help=f"Override output directory (default: {config.OUTPUT_DIR})")
+    parser.add_argument("--no-cache", action="store_true", help="Skip cache, force fresh scrape")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress non-error output")
+    parser.add_argument("--init", action="store_true", help="Run interactive setup wizard then exit")
+    parser.add_argument("--json", action="store_true", help="Output JSON to stdout instead of writing files")
+    args = parser.parse_args()
+
+    # --init: run setup wizard and exit (#17)
+    if args.init:
+        try:
+            from init_scraper import main as init_main
+            init_main()
+        except ImportError:
+            print("Error: init_scraper.py not found")
+            sys.exit(1)
+        return
+
+    # Config validation (#19)
+    cfg_warnings = _validate_config()
+    if cfg_warnings:
+        for w in cfg_warnings:
+            logger.warning("Config: %s", w)
+        if not args.quiet:
+            print("Warning: Configuration issues found (see log for details)")
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+
+    dry_run = args.dry_run or os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
+    output_dir = args.output_dir or config.OUTPUT_DIR
+    skip_cache = args.no_cache
+
+    # Catch-up detection (#41)
+    missed_days = check_missed_runs()
+    if missed_days >= 3:
+        logger.warning("Missed %d days — running full refresh", missed_days)
+        skip_cache = True
+
+    start_time = time.time()
     try:
         logger.info("Fetching events from %s", config.EVENTS_URL)
         
@@ -558,8 +698,9 @@ def main() -> None:
     if config.SKIP_IF_NO_NEW_EVENTS:
         current_upcoming_slugs = {e.get("slug") or e.get("id") or e.get("title") for e in future_events}
         previous_slugs = load_last_upcoming_slugs()
-        if not has_new_events(current_upcoming_slugs, previous_slugs):
-            logger.info("No new events (current=%d, previous=%d), skipping full scrape", 
+        events_unchanged = not has_new_events(current_upcoming_slugs, previous_slugs) and not (previous_slugs - current_upcoming_slugs)
+        if events_unchanged:
+            logger.info("No event changes (current=%d, previous=%d), skipping full scrape",
                        len(current_upcoming_slugs), len(previous_slugs))
             print("No new events. Skipping update.")
             save_last_upcoming_slugs(list(current_upcoming_slugs))
@@ -600,9 +741,11 @@ def main() -> None:
                 f"PRODID:{config.CALENDAR_PRODID}",
                 "CALSCALE:GREGORIAN",
                 "METHOD:PUBLISH",
-                f"X-WR-CALNAME:{config.CALENDAR_NAME}",
-                f"X-WR-CALDESC:{config.CALENDAR_DESCRIPTION}",
+                escape_and_fold_ical_text(config.CALENDAR_NAME, "X-WR-CALNAME:", config.ICAL_LINE_LENGTH),
+                escape_and_fold_ical_text(config.CALENDAR_DESCRIPTION, "X-WR-CALDESC:", config.ICAL_LINE_LENGTH),
                 f"X-WR-TIMEZONE:{config.DEFAULT_TIMEZONE}",
+                "REFRESH-INTERVAL;VALUE=DURATION:PT12H",
+                "X-PUBLISHED-TTL:PT12H",
             ]
         )
         + ICAL_NEWLINE
@@ -610,48 +753,90 @@ def main() -> None:
         + f"END:VCALENDAR{ICAL_NEWLINE}"
     )
 
-    ics_path = Path(config.OUTPUT_DIR) / f"{config.ICS_FILENAME}.ics"
-    ics_path.write_text(ical_content, encoding="utf-8")
-    logger.info("Wrote %s (%d events)", ics_path, len(event_lines))
+    ics_path = Path(output_dir) / f"{config.ICS_FILENAME}.ics"
+    if dry_run:
+        logger.info("DRY-RUN: Would write %s (%d events)", ics_path, len(event_lines))
+    else:
+        atomic_write(ics_path, ical_content)
+        logger.info("Wrote %s (%d events)", ics_path, len(event_lines))
 
     # Save state
     current_upcoming_slugs = {e.get("slug") or e.get("id") or e.get("title") for e in future_events}
-    save_last_upcoming_slugs(list(current_upcoming_slugs))
+    if not dry_run:
+        save_last_upcoming_slugs(list(current_upcoming_slugs))
+        save_health_status("success", len(event_lines),
+            f"Successfully processed {len(event_lines)} events ({len(current_upcoming_slugs)} upcoming)")
 
-    # Save health status
-    save_health_status(
-        "success",
-        len(event_lines),
-        f"Successfully processed {len(event_lines)} events ({len(current_upcoming_slugs)} upcoming)"
-    )
-
-    # Generate HTML pages (import from html_templates)
+    # Generate HTML pages
     try:
-        from html_templates import build_index_html, build_archive_html
-        
-        health_status = load_health_status()
-        index_path = Path(config.OUTPUT_DIR) / "index.html"
-        index_path.write_text(
-            build_index_html(enriched_events, upcoming_count=len(current_upcoming_slugs), health_status=health_status),
-            encoding="utf-8"
-        )
-        logger.info("Wrote %s", index_path)
+        from html_templates import build_index_html, build_archive_html, build_event_page
 
-        if config.INCLUDE_PAST_EVENTS:
-            past_enriched = [e for e in enriched_events 
-                           if parse_iso_datetime(e.get("start_at")) and 
-                           parse_iso_datetime(e.get("start_at")).replace(tzinfo=datetime.timezone.utc) < today]
-            archive_path = Path(config.OUTPUT_DIR) / "archive.html"
-            archive_path.write_text(build_archive_html(past_enriched), encoding="utf-8")
-            logger.info("Wrote %s with %d past events", archive_path, len(past_enriched))
+        health_status = load_health_status()
+        webcal_url = ""
+        if config.SITE_URL:
+            webcal_url = config.SITE_URL.rstrip("/") + "/" + config.ICS_FILENAME + ".ics"
+            webcal_url = webcal_url.replace("https://", "webcal://").replace("http://", "webcal://")
+
+        if not dry_run:
+            index_html = build_index_html(enriched_events, upcoming_count=len(current_upcoming_slugs),
+                                          health_status=health_status, webcal_url=webcal_url)
+            index_path = Path(output_dir) / "index.html"
+            atomic_write(index_path, index_html)
+            logger.info("Wrote %s", index_path)
+
+            # Per-event pages (#32)
+            if config.GENERATE_EVENT_PAGES:
+                events_dir = Path(output_dir) / "events"
+                events_dir.mkdir(parents=True, exist_ok=True)
+                for event in enriched_events[:50]:
+                    slug = event.get("slug") or event.get("id") or hashlib.md5(
+                        (event.get("title", "") + event.get("start_at", "")).encode()).hexdigest()[:12]
+                    event_html = build_event_page(event, slug, site_url=config.SITE_URL)
+                    atomic_write(events_dir / f"{slug}.html", event_html)
+                logger.info("Wrote %d event pages", min(len(enriched_events), 50))
+
+            if config.INCLUDE_PAST_EVENTS:
+                past_enriched = [e for e in enriched_events
+                               if parse_iso_datetime(e.get("start_at")) and
+                               parse_iso_datetime(e.get("start_at")).replace(tzinfo=datetime.timezone.utc) < today]
+                archive_path = Path(output_dir) / "archive.html"
+                atomic_write(archive_path, build_archive_html(past_enriched))
+                logger.info("Wrote %s with %d past events", archive_path, len(past_enriched))
     except ImportError:
         logger.warning("html_templates module not found, skipping HTML generation")
+    except AttributeError:
+        pass  # build_event_page not implemented yet
 
-    print(f"\n✓ Created {config.OUTPUT_DIR}/ with {config.ICS_FILENAME}.ics ({len(event_lines)} events)\n")
-    for event in enriched_events[:10]:  # Show first 10
-        start = parse_iso_datetime(event.get("start_at"))
-        date_str = start.strftime("%d %B %Y %H:%M") if start else "?"
-        print(f"  • {event.get('title')} – {date_str} @ {event.get('location', 'TBC')}")
+    # Prometheus metrics (#37)
+    elapsed = time.time() - start_time
+    write_metrics_file(len(event_lines), len(current_upcoming_slugs), "success", elapsed)
+
+    # Health check endpoint (#23) — plain-text for monitoring tools
+    health_path = Path(output_dir) / "health"
+    if not dry_run:
+        health_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(health_path, "OK\n")
+
+    # Pushover notification on completion (#40)
+    if config.PUSHOVER_ENABLED and not dry_run:
+        send_pushover_notification(
+            f"Scraper: {config.CALENDAR_NAME}",
+            f"{len(event_lines)} events processed ({len(current_upcoming_slugs)} upcoming)\n"
+            f"Duration: {elapsed:.1f}s"
+        )
+
+    # Event count badge (#20) + scrape duration (#24)
+    previous_set = load_last_upcoming_slugs()
+    new_count = len(current_upcoming_slugs - previous_set) if previous_set else len(current_upcoming_slugs)
+    updated_count = len(previous_set - current_upcoming_slugs) if previous_set else 0
+    unchanged = len(current_upcoming_slugs) - new_count
+    if not args.quiet:
+        print(f"\n{'[DRY RUN] ' if dry_run else ''}✓ {len(event_lines)} events "
+              f"({new_count} new, {updated_count} removed, {unchanged} unchanged) in {elapsed:.1f}s\n")
+        for event in enriched_events[:10]:
+            start = parse_iso_datetime(event.get("start_at"))
+            date_str = start.strftime("%d %B %Y %H:%M") if start else "?"
+            print(f"  • {event.get('title')} – {date_str} @ {event.get('location', 'TBC')}")
 
 
 if __name__ == "__main__":
