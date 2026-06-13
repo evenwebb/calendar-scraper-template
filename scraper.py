@@ -804,7 +804,7 @@ def main() -> None:
                 logger.info("Wrote %s with %d past events", archive_path, len(past_enriched))
     except ImportError:
         logger.warning("html_templates module not found, skipping HTML generation")
-    except AttributeError:
+    except (AttributeError, ImportError):
         pass  # build_event_page not implemented yet
 
     # Prometheus metrics (#37)

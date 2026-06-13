@@ -5,11 +5,11 @@ CUSTOMIZE THIS to match your branding, colors, and layout preferences.
 import datetime
 import html as _html
 
+import json
 
 def _esc(text: str) -> str:
     """HTML-escape text for safe insertion into HTML."""
     return _html.escape(str(text or ""), quote=True)
-import json
 from typing import Any, Dict, List, Optional
 
 import config
